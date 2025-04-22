@@ -1,0 +1,360 @@
+import math
+import os
+from multiprocessing.sharedctypes import Value
+
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from models import GCN
+from torch_geometric.utils import degree
+from torch_sparse import SparseTensor, matmul
+
+
+def full_attention_conv(qs, ks, vs, output_attn=False):
+    # N:query个数 L:key个数 H:model_head个数 M:hidden_layer特征个数 D;output(value) 的 embedding 维度
+    # 根据 query/key 的相似度对 value 做加权聚合 
+    # 这段代码的确在做「Attention」机制；若 qs = ks = vs 源于同一个序列/特征，那么就可以说是自注意力。
+    # 但它并不是标准的「缩放点积（Scaled Dot‐Product）+ Softmax」，而是一个自定义的归一化方式 (QKV + N * V) / (QK + N)
+    
+    # normalize input
+    '''
+    qs = qs / torch.norm(qs, p=2)  # [N, H, M]
+    ks = ks / torch.norm(ks, p=2)  # [L, H, M]
+    '''
+    # 归一化计算修改
+    qs = F.normalize(qs, p=2, dim=-1)  # [N, H, M]
+    ks = F.normalize(ks, p=2, dim=-1)  # [L, H, M]
+    N = qs.shape[0]
+
+    # numerator
+    kvs = torch.einsum("lhm,lhd->hmd", ks, vs)
+    attention_num = torch.einsum("nhm,hmd->nhd", qs, kvs)  # [N, H, D]
+    # attention_num += vs
+    attention_num += N * vs
+    # print(attention_num)
+
+    # denominator
+    all_ones = torch.ones([ks.shape[0]]).to(ks.device)
+    ks_sum = torch.einsum("lhm,l->hm", ks, all_ones)
+    attention_normalizer = torch.einsum("nhm,hm->nh", qs, ks_sum)  # [N, H]
+
+    # attentive aggregated results
+    attention_normalizer = torch.unsqueeze(
+        attention_normalizer, len(attention_normalizer.shape))  # [N, H, 1]
+    # attention_normalizer += torch.ones_like(attention_normalizer)
+    attention_normalizer += torch.ones_like(attention_normalizer) * N
+    attn_output = attention_num / attention_normalizer  # [N, H, D]
+    # print(attn_output)
+
+    # compute attention for visualization if needed
+    if output_attn:
+        attention=torch.einsum("nhm,lhm->nlh", qs, ks).mean(dim=-1) #[N, N]
+        normalizer=attention_normalizer.squeeze(dim=-1).mean(dim=-1,keepdims=True) #[N,1]
+        attention=attention/normalizer
+
+    if output_attn:
+        return attn_output, attention
+    else:
+        return attn_output
+
+
+class TransConvLayer(nn.Module):
+    '''
+    transformer with fast attention
+    '''
+
+    def __init__(self, in_channels,
+                 out_channels,
+                 num_heads,
+                 use_weight=True):
+        super().__init__()
+        self.Wk = nn.Linear(in_channels, out_channels * num_heads)
+        self.Wq = nn.Linear(in_channels, out_channels * num_heads)
+        if use_weight:
+            self.Wv = nn.Linear(in_channels, out_channels * num_heads)
+
+        self.out_channels = out_channels
+        self.num_heads = num_heads
+        self.use_weight = use_weight
+
+    def reset_parameters(self):
+        self.Wk.reset_parameters()
+        self.Wq.reset_parameters()
+        if self.use_weight:
+            self.Wv.reset_parameters()
+
+    def forward(self, query_input, source_input, edge_index=None, edge_weight=None, output_attn=False):
+        '''
+        query_input:表示输入到查Query的特征。一般是节点特征数据,经过线性变换后用来生成查询向量。
+        source_input:表示用来生成Key和Value的特征。自注意力中, query_input和source_input是一样的,但也支持不同输入场景,使得模型能够从另一个信息源中获取聚合信息。
+        edge_index(默认值为 None):图的边连接信息，通常是一个形如 [2, num_edges] 的张量，描述了图中各个边的起始节点和目标节点。
+        edge_weight(默认 None):表示边的权重，即每条边在聚合时的影响程度,方便在一些需要加权边信息的场景下进行扩展
+        output_attn(默认 False):控制是否额外返回注意力矩阵，用于可视化或进一步的分析。
+        '''
+        # feature transformation
+        query = self.Wq(query_input).reshape(-1,
+                                             self.num_heads, self.out_channels)
+        key = self.Wk(source_input).reshape(-1,
+                                            self.num_heads, self.out_channels)
+        if self.use_weight:
+            value = self.Wv(source_input).reshape(-1,
+                                                  self.num_heads, self.out_channels)
+        else:
+            value = source_input.reshape(-1, 1, self.out_channels)
+
+        # compute full attentive aggregation
+        if output_attn:
+            attention_output, attn = full_attention_conv(
+                query, key, value, output_attn)  # [N, H, D]
+        else:
+            attention_output = full_attention_conv(
+                query, key, value)  # [N, H, D]
+
+        final_output = attention_output
+        final_output = final_output.mean(dim=1)
+
+        if output_attn:
+            return final_output, attn
+        else:
+            return final_output
+
+
+class TransConv(nn.Module):
+    def __init__(self, in_channels, hidden_channels, num_layers=2, num_heads=1,
+                 alpha=0.5, dropout=0.5, use_bn=True, use_residual=True, use_weight=True, use_act=False):
+        super().__init__()
+
+        self.convs = nn.ModuleList()
+        self.fcs = nn.ModuleList()
+        self.fcs.append(nn.Linear(in_channels, hidden_channels))
+        self.bns = nn.ModuleList()
+        self.bns.append(nn.LayerNorm(hidden_channels))
+        for i in range(num_layers):
+            self.convs.append(
+                TransConvLayer(hidden_channels, hidden_channels, num_heads=num_heads, use_weight=use_weight))
+            self.bns.append(nn.LayerNorm(hidden_channels))
+
+        self.dropout = dropout
+        self.activation = F.relu
+        self.use_bn = use_bn
+        self.residual = use_residual
+        self.alpha = alpha
+        self.use_act=use_act
+
+    def reset_parameters(self):
+        for conv in self.convs:
+            conv.reset_parameters()
+        for bn in self.bns:
+            bn.reset_parameters()
+        for fc in self.fcs:
+            fc.reset_parameters()
+
+    def forward(self, data):
+        x = data.graph['node_feat']
+        edge_index = data.graph['edge_index']
+        edge_weight = data.graph['edge_weight'] if 'edge_weight' in data.graph else None
+        layer_ = []
+
+        # input MLP layer
+        x = self.fcs[0](x)
+        if self.use_bn:
+            x = self.bns[0](x)
+        x = self.activation(x)
+        x = F.dropout(x, p=self.dropout, training=self.training)
+
+        layer_.append(x)
+
+        for i, conv in enumerate(self.convs):
+            # graph convolution with full attention aggregation
+            # query_input source_input edge_index edge_weight 此处是self attention query 和 source是一致的 形成全局注意力
+            x = conv(x, x, edge_index, edge_weight)
+            if self.residual:
+                x = self.alpha * x + (1-self.alpha) * layer_[i]
+            if self.use_bn:
+                x = self.bns[i+1](x)
+            if self.use_act:
+                x = self.activation(x) 
+            x = F.dropout(x, p=self.dropout, training=self.training)
+            layer_.append(x)
+
+        return x
+
+    def get_attentions(self, x):
+        layer_, attentions = [], []
+        x = self.fcs[0](x)
+        if self.use_bn:
+            x = self.bns[0](x)
+        x = self.activation(x)
+        layer_.append(x)
+        for i, conv in enumerate(self.convs):
+            x, attn = conv(x, x, output_attn=True)
+            attentions.append(attn)
+            if self.residual:
+                x = self.alpha * x + (1 - self.alpha) * layer_[i]
+            if self.use_bn:
+                x = self.bns[i + 1](x)
+            layer_.append(x)
+        return torch.stack(attentions, dim=0)  # [layer num, N, N]
+
+class SGFormer(nn.Module):
+    def __init__(self, 
+                 in_channels,      # 嵌入维度(embedding_dim)
+                 hidden_channels, 
+                 out_channels,     # BPR时，可以是最终的隐向量维度
+                 num_layers=2, 
+                 num_heads=1, 
+                 alpha=0.5, 
+                 dropout=0.5, 
+                 use_bn=True, 
+                 use_residual=True, 
+                 use_weight=True, 
+                 use_graph=True, 
+                 use_act=False, 
+                 graph_weight=0.8, 
+                 gnn=None, 
+                 aggregate='add',
+                 num_users=None,   # 新增: 用户数
+                 num_items=None):  # 新增: 物品数
+        super().__init__()
+
+        # 1) 用户/物品 Embedding
+        if (num_users is None) or (num_items is None):
+            raise ValueError("when init SGFormer please input num_users and num_items")
+
+        self.num_users = num_users
+        self.num_items = num_items
+        self.num_nodes = num_users + num_items
+
+        self.embedding_user = nn.Embedding(num_users, in_channels)
+        self.embedding_item = nn.Embedding(num_items, in_channels)
+
+        # 2) Transformer 分支
+        self.trans_conv = TransConv(
+            in_channels, hidden_channels,
+            num_layers=num_layers, num_heads=num_heads,
+            alpha=alpha, dropout=dropout,
+            use_bn=use_bn, use_residual=use_residual,
+            use_weight=use_weight, use_act=use_act
+        )
+
+        # 3) GNN 分支 (例如 GCN)
+        self.gnn = gnn
+        self.use_graph = use_graph
+        self.graph_weight = graph_weight
+        self.aggregate = aggregate
+
+        # 4) 聚合后的输出层
+        if aggregate == 'add':
+            self.fc = nn.Linear(hidden_channels, out_channels)
+        elif aggregate == 'cat':
+            self.fc = nn.Linear(2 * hidden_channels, out_channels)
+        else:
+            raise ValueError(f'Invalid aggregate type: {aggregate}')
+
+        # 5) 参数分组
+        # params1：TransConv + Embedding
+        # params2：GNN + fc 
+        self.params1 = list(self.trans_conv.parameters()) + \
+                       list(self.embedding_user.parameters()) + \
+                       list(self.embedding_item.parameters())
+
+        self.params2 = []
+        if self.gnn is not None:
+            self.params2 += list(self.gnn.parameters())
+        self.params2 += list(self.fc.parameters())
+
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        nn.init.normal_(self.embedding_user.weight, std=0.1)
+        nn.init.normal_(self.embedding_item.weight, std=0.1)
+
+        self.trans_conv.reset_parameters()
+
+        if self.gnn is not None:
+            self.gnn.reset_parameters()
+
+        '''
+        nn.init.xavier_uniform_(self.fc.weight)
+        if self.fc.bias is not None:
+            nn.init.zeros_(self.fc.bias)
+        '''
+        
+    def encode(self, data):
+        """
+        预训练 对比学习阶段使用，返回融合后的图嵌入（不经过 fc)
+        """
+        # 1) 构造初始用户＋物品特征
+        device = data.graph['edge_index'].device
+        u_ids = torch.arange(self.num_users, device=device)
+        i_ids = torch.arange(self.num_items, device=device)
+        u_emb = self.embedding_user(u_ids)  # [num_users, in_ch]
+        i_emb = self.embedding_item(i_ids)  # [num_items, in_ch]
+        x_init = torch.cat([u_emb, i_emb], dim=0)  # [N, in_ch]
+
+        # 写回 data，让 trans_conv/gnn 都能拿到
+        data.graph['node_feat'] = x_init
+
+        # 2) GraphTransformer 分支
+        x1 = self.trans_conv(data)  # [N, hidden_ch]
+
+        # 3) 可选的 GNN 分支
+        if self.use_graph and (self.gnn is not None):
+            x2 = self.gnn(data)  # [N, hidden_ch]
+            if self.aggregate == 'add':
+                x = self.graph_weight * x2 + (1 - self.graph_weight) * x1
+            else:  # cat
+                x = torch.cat([x1, x2], dim=1)  # [N, 2*hidden_ch]
+        else:
+            x = x1
+
+        # **不经过最后的 fc**，直接返回 x 作为对比学习的 embedding
+        return x
+
+
+    def forward(self, data):
+        # 1) num_users, num_items 构造节点特征
+        device = data.graph['edge_index'].device
+
+        user_ids = torch.arange(self.num_users, device=device)
+        item_ids = torch.arange(self.num_items, device=device)
+
+        user_emb = self.embedding_user(user_ids)   # [num_users, in_channels]
+        item_emb = self.embedding_item(item_ids)   # [num_items, in_channels]
+        x_init   = torch.cat([user_emb, item_emb], dim=0)  # [N, in_channels], N=num_users+num_items
+
+        # 2) 写入 data.graph['node_feat'] 里，让 trans_conv / gnn 都能拿到
+        data.graph['node_feat'] = x_init
+
+        # 3) GraphTransformer
+        x1 = self.trans_conv(data)  # 得到 [N, hidden_channels]
+
+        # 4) GraphConv (GCN or else backbone)
+        if self.use_graph and (self.gnn is not None):
+            x2 = self.gnn(data)     # [N, hidden_channels]
+            if self.aggregate == 'add':
+                x = self.graph_weight * x2 + (1 - self.graph_weight) * x1
+            else:
+                x = torch.cat((x1, x2), dim=1)  # [N, 2*hidden_channels]
+        else:
+            x = x1
+
+        x = self.fc(x)  # [N, out_channels]
+
+        return x
+
+    def get_attentions(self, data):
+        """
+        可视化多头注意力矩阵
+        """
+        device = data.graph['edge_index'].device
+        user_ids = torch.arange(self.num_users, device=device)
+        item_ids = torch.arange(self.num_items, device=device)
+        user_emb = self.embedding_user(user_ids)
+        item_emb = self.embedding_item(item_ids)
+        x_init   = torch.cat([user_emb, item_emb], dim=0)
+
+        # 用 trans_conv 内置的 get_attentions 来获取注意力矩阵
+        attns = self.trans_conv.get_attentions(x_init)
+        return attns
