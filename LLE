@@ -1,0 +1,61 @@
+import torch
+from sklearn.neighbors import NearestNeighbors
+import numpy as np
+import time
+
+class LLEUpdater:
+    def __init__(self, k=10, alpha=0.5, sgd_steps=3, lr=1e-3):
+        self.k = k
+        self.alpha = alpha
+        self.sgd_steps = sgd_steps
+        self.lr = lr
+
+    def update_items(self, model, dataset, new_item_ids, device='cuda'):
+        if len(new_item_ids) == 0:      # nothing to do
+            return {}
+
+        t0 = time.time()
+        model.eval()
+        with torch.no_grad():
+            full_emb = model(dataset)         # (num_users + num_items, d)
+        d = full_emb.size(1)
+        item_emb = full_emb[model.num_users:].detach().cpu()   # (N_items, d)
+
+        # ---------- LLE ----------
+        new_item_ids = torch.as_tensor(new_item_ids, dtype=torch.long)
+        new_seed = torch.zeros((len(new_item_ids), d))         # (M, d)
+
+        nbrs = NearestNeighbors(n_neighbors=self.k, algorithm='auto').fit(
+            item_emb.numpy()
+        )
+        dists, idx = nbrs.kneighbors(new_seed.numpy())
+
+        Z = item_emb[idx] - new_seed[:, None, :]               # (M, k, d), float32
+        C = torch.bmm(Z, Z.transpose(1, 2))                    # float32
+        C += torch.eye(self.k, device=C.device)[None] * 1e-3
+        
+        rhs = C.new_ones(C.size(0), self.k)                    # (M, k), float32
+        W = torch.linalg.solve(C, rhs)                         # (M, k), float32
+        W = W / W.sum(-1, keepdim=True)
+
+        delta = (W[..., None] * item_emb[idx]).sum(dim=1)      # (M, d)
+
+        with torch.no_grad():
+            dst = model.embedding_item.weight.data     
+            for tgt, vec in zip(new_item_ids, delta):
+                dst[tgt] = (1 - self.alpha) * dst[tgt] + self.alpha * vec.to(dst.device)
+
+        if self.sgd_steps > 0:
+            optim = torch.optim.SGD(
+                [model.embedding_item.weight],         
+                lr=self.lr, momentum=0.9
+            )
+            for _ in range(self.sgd_steps):
+                new_vecs = model.embedding_item(
+                    new_item_ids.to(dst.device)        
+                )
+                loss = ((new_vecs - delta.to(dst.device))**2).sum() / len(new_item_ids)
+                optim.zero_grad(); loss.backward(); optim.step()
+
+        consumed = time.time() - t0
+        return {"n_new": len(new_item_ids), "time_sec": consumed}
